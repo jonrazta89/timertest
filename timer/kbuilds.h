@@ -35,12 +35,14 @@ struct kbuild
 /* --- build includes (timer-extract registers here) --- */
 #include "kbuilds/6.12.69-android16-6-g242e1a07f878-ab15865446-4k.h"
 #include "kbuilds/6.12.69-android16-6-g5fd39602326e-ab16372235-4k.h"
+#include "kbuilds/6.12.69-android16-6-pa4ef354-abogkiS948USQU5BZJA-4k.h"
 /* --- end build includes --- */
 
 static const struct kbuild *const kbuild_table[] = {
     /* --- build entries (timer-extract registers here) --- */
     &kbuild_6_12_69_android16_6_g242e1a07f878_ab15865446_4k,
     &kbuild_6_12_69_android16_6_g5fd39602326e_ab16372235_4k,
+    &kbuild_6_12_69_android16_6_pa4ef354_abogkiS948USQU5BZJA_4k,
 /* --- end build entries --- */
 };
 

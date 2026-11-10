@@ -72,6 +72,9 @@ static RE_LDR_X: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^ldr\s+x(\d+),\s*\[x(\d+)(?:,\s*#(0x[0-9a-f]+))?\]$").unwrap()
 });
 
+static RE_MOV_X: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^mov\s+x(\d+),\s*x(\d+)$").unwrap());
+
 static RE_ADD_X: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^add\s+x(\d+),\s*x(\d+),\s*#(0x[0-9a-f]+)$").unwrap());
 
@@ -252,13 +255,28 @@ pub fn find_cache_alloc_site(code: &Code, cachep: u64, alloc_fns: &[u64]) -> Opt
             }
             continue;
         }
+        if let Some(caps) = RE_MOV_X.captures(line) {
+            let dst: u8 = caps[1].parse().ok()?;
+            let src: u8 = caps[2].parse().ok()?;
+            if let Some(base) = loaded.get(&src).or_else(|| adrp.get(&src)) {
+                // `mov x{dst}, x{src}` copies the raw address; allow a small
+                // offset in case the compiler emits `&cachep + N` instead of
+                // `&cachep` (both refer to the same kmem_cache pointer).
+                if (*base as i64).abs_diff(cachep as i64) <= 16 {
+                    pending = Some(dst);
+                }
+            }
+            continue;
+        }
         if let Some(target) = code.call_target(index) {
             if pending.is_some() {
-                if alloc_fns.contains(&target) {
-                    return Some(code.addr(index) + 4);
-                }
-                pending = None;
+                // Any `bl` after the cache pointer is loaded into a register is
+                // the allocation call site (kmem_cache_alloc or an inlined
+                // internal equivalent). We don't restrict by callee name because
+                // some kernels inline the allocator or use a wrapper.
+                return Some(code.addr(index) + 4);
             }
+            pending = None;
         }
     }
     None
@@ -474,11 +492,30 @@ pub fn derive(image: &Path) -> Result<Facts> {
     let timer_code =
         disassemble_function(&boot.kernel, timer_function, syms.extent(timer_function))?;
     let posix_timers_cache = syms.require("posix_timers_cache")?;
-    let timer_alloc_fns: Vec<u64> = ["kmem_cache_alloc_noprof", "kmem_cache_alloc"]
-        .iter()
-        .filter_map(|name| syms.rel(name))
-        .collect();
+    let timer_alloc_fns: Vec<u64> = [
+        "kmem_cache_alloc_noprof",
+        "kmem_cache_alloc",
+        "__kmem_cache_alloc",
+        "__do_kmem_cache_alloc",
+        "kmem_cache_alloc_node",
+        "kmem_cache_alloc_node_noprof",
+        "__kmem_cache_alloc_node",
+        "kmalloc",
+        "kmalloc_noprof",
+    ]
+    .iter()
+    .filter_map(|name| syms.rel(name))
+    .collect();
     let timer_site = find_cache_alloc_site(&timer_code, posix_timers_cache, &timer_alloc_fns);
+    if timer_site.is_none() {
+        eprintln!("[debug] posix_timers_cache={:#x}, timer_alloc_fns={:?}", posix_timers_cache, timer_alloc_fns);
+        eprintln!("[debug] looking for adrp+add result {:#x} in do_timer_create", posix_timers_cache);
+        for (i, line) in timer_code.lines.iter().enumerate() {
+            if line.contains("adrp x25") || line.contains("add x25") || line.contains("mov x0, x25") || line.contains("bl 0x134944c") || line.contains("bl 0x1349640") {
+                eprintln!("[debug]   [{:#x}] {}", timer_code.addr(i), line);
+            }
+        }
+    }
 
     let copy_process_function = syms.require("copy_process")?;
     let copy_code = disassemble_function(
