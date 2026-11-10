@@ -1,6 +1,6 @@
 # CVE-2026-98260 Timer LPE
 
-`6.12.69-android16-6-g242e1a07f878` 的 CVE-2026-98260 POSIX CPU timer UAF 移植
+CVE-2026-98260 POSIX CPU timer UAF 移植，支持情况见「内核支持」
 
 两条链：
 
@@ -33,12 +33,21 @@ $NDK/aarch64-linux-android35-clang -O2 -std=gnu11 -static \
 
 ## 内核支持
 
-不同内核各自一个 `timer/kbuilds/<release>.h`，由 `timer/kbuilds.h` 索引；`timer` 按 `uname -r` 整串匹配
+per-build 常量各自一个 `timer/kbuilds/<release>.h`，由 `timer/kbuilds.h` 索引；`timer.c` 只含逻辑，`timer` 按 `uname -r` 整串匹配，未命中时打印已知 build 并退出
+
+已支持：
+
+- `6.12.69-android16-6-g242e1a07f878-ab15865446-4k`
+- `6.12.69-android16-6-g5fd39602326e-ab16372235-4k`
+
+新增内核（检测 98260 + 写入并登记 profile；退出码 0 可打、3 已修复、1 出错）：
 
 ```sh
 cargo build --release --manifest-path tools/extract/Cargo.toml
-tools/extract/target/release/timer-extract boot.img --add   # 检测 98260 + 写入并登记 profile
+tools/extract/target/release/timer-extract boot.img --add
 ```
+
+`tools/*.c` 用于核对 call site、raw record、timer 泄漏与 8 KiB AF_UNIX 回收通道。
 
 ## 使用
 
@@ -88,16 +97,6 @@ timer/timer        静态产物
 tools/*.c          移植诊断源码
 tools/extract/     提取器与检测（Rust，bin timer-extract）
 ```
-
-## 移植
-
-per-build 常量在 `timer/kbuilds/<release>.h`，`timer.c` 只含逻辑；添加内核：
-
-```sh
-tools/extract/target/release/timer-extract <boot.img> --add
-```
-
-`tools/*.c` 用于核对 call site、raw record、timer 泄漏与 8 KiB AF_UNIX 回收通道。
 
 ## 参考
 
